@@ -2142,7 +2142,6 @@ F.markDirty(0)
 F.scheduleFallbackScan()
 
 
--- Reactive listener for inventory opening/closing: 0% CPU when walking!
 task.spawn(function()
 	local mainGui = playerGui:WaitForChild("MainGUI", 10)
 	local gameFrame = mainGui and mainGui:WaitForChild("Game", 10)
