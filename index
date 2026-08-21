@@ -13,26 +13,35 @@ local CONFIG = {
 	PUBLIC_CATALOG_URL = "https://mm2-api.b-cdn.net/mm2values.json",
 	FALLBACK_CATALOG_URL = "https://mm2checker.com/tradechecker.html",
 	SCAN_SECONDS = 0.1,
-	FULL_SCAN_SECONDS = 0.5,
+	FULL_SCAN_SECONDS = 15,
 	SHOW_DEMAND = true,
 	HIDE_AFTER_SECONDS = 0.9,
 	STARPETS_API_URL = "https://mm2-market.apineural.com/api/v2/store/items/all",
 	STARPETS_PAGE_SIZE = 72,
-	STARPETS_WORKERS = 3,
-	STARPETS_LOOKUP_WORKERS = 3,
+	STARPETS_WORKERS = 2,
+	STARPETS_LOOKUP_WORKERS = 2,
 	PRIORITY_LOOKUP_LIMIT = 12,
 	PRIORITY_TIMEOUT_SECONDS = 5,
 	HTTP_TIMEOUT_SECONDS = 8,
 }
-local SCRIPT_VERSION = "2026.08.21.41-mobile-trade-layout"
+local SCRIPT_VERSION = "2026.08.21.45-view-profile-values"
 
 local shared = (getgenv and getgenv()) or _G
 if type(shared.MM2TradeValueOverlayStop) == "function" then
-	shared.MM2TradeValueOverlayStop()
+	pcall(shared.MM2TradeValueOverlayStop)
 end
 shared.MM2TradeValueOverlayVersion = SCRIPT_VERSION
 local running = true
 local F = {}
+local function clampNumber(value, minimum, maximum)
+	if value < minimum then return minimum end
+	if value > maximum then return maximum end
+	return value
+end
+local function roundNumber(value)
+	if value >= 0 then return math.floor(value + 0.5) end
+	return math.ceil(value - 0.5)
+end
 shared.MM2TradeValueOverlayStop = function()
 	running = false
 end
@@ -41,6 +50,7 @@ assert(type(requestFn) == "function", "This script needs an HTTP request functio
 
 local HttpService = game:GetService("HttpService")
 local TweenService = game:GetService("TweenService")
+local Workspace = game:GetService("Workspace")
 local playerGui = localPlayer:WaitForChild("PlayerGui")
 local currentJobId = tostring(game.JobId or "")
 local currentPlayerInstance = localPlayer
@@ -94,18 +104,18 @@ local loadingRefs = nil
 local loadingStartedAt = 0
 local modeCollapsed = shared.MM2ModePanelCollapsed == true
 local modePanelTween = nil
-local modeVisibilityRevision = 0
 local cleanupConnections = {}
 local uiDirty = true
 local lastFullScan = 0
-local lastTradeGui, lastInventoryGui = nil, nil
+local lastTradeGui, lastInventoryGui, lastInventoryRoot = nil, nil, nil
 local watchedProperties = setmetatable({}, { __mode = "k" })
+local watchedMutationRoots = setmetatable({}, { __mode = "k" })
 local overlayUpdateScheduled = false
 function F.markDirty(delay)
 	uiDirty = true
 	if overlayUpdateScheduled or type(F.updateOverlays) ~= "function" then return end
 	overlayUpdateScheduled = true
-	task.delay(delay or 0.03, function()
+	task.delay(delay or 0.06, function()
 		overlayUpdateScheduled = false
 		if running then pcall(F.updateOverlays) end
 	end)
@@ -119,14 +129,6 @@ shared.MM2TradeValueOverlayStop = function()
 	if loadingGui then pcall(function() loadingGui:Destroy() end) end
 	if F.starPetsLookupSignal then pcall(function() F.starPetsLookupSignal:Destroy() end) end
 end
-
-table.insert(cleanupConnections, playerGui.DescendantAdded:Connect(function()
-	F.markDirty()
-end))
-table.insert(cleanupConnections, playerGui.DescendantRemoving:Connect(function()
-	F.markDirty()
-end))
-
 
 function F.watchProperty(object, property)
 	if not object then return end
@@ -151,6 +153,35 @@ function F.watchVisibility(object, root)
 		node = node.Parent
 	end
 	if root and root:IsA("ScreenGui") then F.watchProperty(root, "Enabled") end
+end
+
+function F.isManagedOverlayTree(object)
+	local node = object
+	while node and node ~= playerGui do
+		local name = node.Name
+		if name == OVERLAY_NAME or name == INVENTORY_OVERLAY_NAME or name == TOTAL_NAME
+			or name == MODE_GUI_NAME or name == LOADING_GUI_NAME then return true end
+		node = node.Parent
+	end
+	return false
+end
+
+function F.isRelevantUiMutation(object)
+	if not object or F.isManagedOverlayTree(object) then return false end
+	if object:IsA("TextLabel") or object:IsA("TextButton")
+		or object:IsA("ImageLabel") or object:IsA("ImageButton") then return true end
+	return object:IsA("Frame") and object.Name:match("^NewItem%d+$") ~= nil
+end
+
+function F.watchMutationRoot(root)
+	if not root or watchedMutationRoots[root] then return end
+	watchedMutationRoots[root] = true
+	table.insert(cleanupConnections, root.DescendantAdded:Connect(function(object)
+		if F.isRelevantUiMutation(object) then F.markDirty(0.08) end
+	end))
+	table.insert(cleanupConnections, root.DescendantRemoving:Connect(function(object)
+		if F.isRelevantUiMutation(object) then F.markDirty(0.08) end
+	end))
 end
 
 for _, object in ipairs(playerGui:GetDescendants()) do
@@ -388,7 +419,6 @@ function F.isEffectivelyVisible(object, root)
 end
 
 local cachedTradeGui, cachedHeaders = nil, nil
-local nextTradeSearch = 0
 
 function F.scanOfferHeaders(gui)
 	local headers = {}
@@ -487,52 +517,36 @@ function F.findTradeGui()
 		if active then return active end
 	end
 	cachedTradeGui, cachedHeaders = nil, nil
-	if os.clock() < nextTradeSearch then return nil end
-	nextTradeSearch = os.clock() + 0.5
-	for _, gui in ipairs(playerGui:GetChildren()) do
-		if gui:IsA("ScreenGui") and gui.Enabled and (gui.Name:find("Trade") or gui.Name:find("trade")) then
-			local headers = F.scanOfferHeaders(gui)
-			if #headers >= 2 then
-				cachedTradeGui, cachedHeaders = gui, headers
-				return gui
-			end
-		end
-	end
 	return nil
 end
 
 local cachedInventoryGui, cachedInventoryMarker = nil, nil
-local nextInventorySearch = 0
 
 function F.findInventoryGui()
 	local mainGui = playerGui:FindFirstChild("MainGUI")
 	if mainGui and mainGui:IsA("ScreenGui") and mainGui.Enabled then
 		local gameFrame = mainGui:FindFirstChild("Game")
-		local inv = gameFrame and gameFrame:FindFirstChild("Inventory")
-		if inv and inv:IsA("GuiObject") and inv.Visible then
-			local marker = inv:FindFirstChild("Title") or inv:FindFirstChild("Main") or inv
-			cachedInventoryGui, cachedInventoryMarker = mainGui, marker
-			return mainGui
-		end
-	end
-	cachedInventoryGui, cachedInventoryMarker = nil, nil
-	if os.clock() < nextInventorySearch then return nil end
-	nextInventorySearch = os.clock() + 0.5
-	for _, gui in ipairs(playerGui:GetChildren()) do
-		if gui:IsA("ScreenGui") and gui.Enabled and gui.Name ~= "Scoreboard" and gui.Name ~= "CameraFade" and gui.Name ~= "SpawnFade" then
-			for _, object in ipairs(gui:GetDescendants()) do
-				if (object:IsA("TextLabel") or object:IsA("TextButton"))
-					and F.isEffectivelyVisible(object, gui) then
-					local text = normalise(object.Text)
-					if text == "season1" then
-						F.watchVisibility(object, gui)
-						cachedInventoryGui, cachedInventoryMarker = gui, object
-						return gui
-					end
+		for _, frameName in ipairs({ "ViewProfile", "Inventory" }) do
+			local inventoryFrame = gameFrame and gameFrame:FindFirstChild(frameName)
+			local marker = inventoryFrame and (inventoryFrame:FindFirstChild("Main") or inventoryFrame)
+			if inventoryFrame and inventoryFrame:IsA("GuiObject")
+				and marker and marker:IsA("GuiObject")
+				and F.isEffectivelyVisible(inventoryFrame, mainGui)
+				and F.isEffectivelyVisible(marker, mainGui) then
+				local position, size = marker.AbsolutePosition, marker.AbsoluteSize
+				local camera = Workspace.CurrentCamera
+				local viewport = camera and camera.ViewportSize or Vector2.new(100000, 100000)
+				local onScreen = size.X > 50 and size.Y > 50
+					and position.X < viewport.X and position.Y < viewport.Y
+					and position.X + size.X > 0 and position.Y + size.Y > 0
+				if onScreen then
+					cachedInventoryGui, cachedInventoryMarker = mainGui, marker
+					return mainGui
 				end
 			end
 		end
 	end
+	cachedInventoryGui, cachedInventoryMarker = nil, nil
 	return nil
 end
 
@@ -995,7 +1009,7 @@ end
 function F.rubNumber(value)
 	value = tonumber(value)
 	if not value then return "?" end
-	if math.abs(value - math.round(value)) < 0.001 then return tostring(math.round(value)) end
+	if math.abs(value - roundNumber(value)) < 0.001 then return tostring(roundNumber(value)) end
 	return ("%.2f"):format(value):gsub("0+$", ""):gsub("%.$", "")
 end
 
@@ -1113,7 +1127,6 @@ function F.refreshStarPetsCatalog()
 	assert(running, "script stopped")
 	assert(not failed, failed)
 
-	if itemCount < 300 then warn("StarPets catalog partial: " .. itemCount) end
 	starPetsState.byName = nextIndex
 	starPetsState.complete = true
 	starPetsCatalogComplete = true
@@ -1487,7 +1500,7 @@ end
 
 function F.renderLoadingState()
 	if not loadingRefs then return end
-	local progress = math.clamp(tonumber(loadingState.progress) or 0, 0, 1)
+	local progress = clampNumber(tonumber(loadingState.progress) or 0, 0, 1)
 	loadingRefs.status.Text = loadingState.status
 	loadingRefs.percent.Text = tostring(math.floor(progress * 100 + 0.5)) .. "%"
 	loadingRefs.fill.Size = UDim2.new(progress, 0, 1, 0)
@@ -1902,16 +1915,8 @@ function F.makeModeSelector()
 end
 
 function F.updateModeSelector(inventoryGui, tradeGui)
-	modeVisibilityRevision = modeVisibilityRevision + 1
-	local revision = modeVisibilityRevision
 	if not inventoryGui and not tradeGui then
-		if modeGui and modeGui.Enabled then
-			task.delay(0.14, function()
-				if running and revision == modeVisibilityRevision and modeGui then
-					modeGui.Enabled = false
-				end
-			end)
-		end
+		if modeGui and modeGui.Enabled then modeGui.Enabled = false end
 		return
 	end
 	F.makeModeSelector()
@@ -1924,8 +1929,8 @@ end
 
 function F.formatValue(value)
 	value = tonumber(value) or 0
-	if math.abs(value - math.round(value)) < 0.00001 then
-		return tostring(math.round(value))
+	if math.abs(value - roundNumber(value)) < 0.00001 then
+		return tostring(roundNumber(value))
 	end
 	return ("%.6f"):format(value):gsub("0+$", ""):gsub("%.$", "")
 end
@@ -1979,7 +1984,7 @@ function F.mobileTotalBounds(header, tradeGui)
 	local left = math.floor(titleRight + 10)
 	local right = math.floor(tutorialLeft - 10)
 	if right - left < 72 then return nil end
-	local height = math.clamp(math.floor(header.AbsoluteSize.Y * 0.72), 22, 34)
+	local height = clampNumber(math.floor(header.AbsoluteSize.Y * 0.72), 22, 34)
 	local y = math.floor(header.AbsolutePosition.Y + (header.AbsoluteSize.Y - height) / 2 + 1)
 	return left, y, right - left, height
 end
@@ -2063,10 +2068,10 @@ end
 function F.collectVisibleCardSlots(gui, now)
 	local scanRoot = gui
 	if gui.Name == "MainGUI" then
-		local gameFrame = gui:FindFirstChild("Game")
-		local inv = gameFrame and gameFrame:FindFirstChild("Inventory")
-		if inv and inv.Visible then
-			scanRoot = inv:FindFirstChild("Main") or inv
+		if cachedInventoryMarker and cachedInventoryMarker:IsDescendantOf(gui) then
+			scanRoot = cachedInventoryMarker
+		else
+			return {}
 		end
 	elseif gui.Name == "TradeGUI" or gui.Name == "TradeGUI_Phone" then
 		local container = gui:FindFirstChild("Container")
@@ -2100,9 +2105,10 @@ function F.collectVisibleCardSlots(gui, now)
 	return labelsBySlot
 end
 
-function F.updateCard(slot, selected, regions, now)
+function F.updateCard(slot, selected, regions, now, gui)
 	local object = selected.object
 	F.watchProperty(object, "Text")
+	F.watchVisibility(object, gui)
 	local query = normalise(object.Text)
 	local candidates = valuesByName[query]
 	local region = regions and F.offerRegionFor(slot, regions) or nil
@@ -2143,7 +2149,7 @@ function F.updateCards(gui, regions, now)
 	local processedSlots = 0
 	for slot, selected in pairs(F.collectVisibleCardSlots(gui, now)) do
 		processedSlots = processedSlots + 1
-		local region, shownValue = F.updateCard(slot, selected, regions, now)
+		local region, shownValue = F.updateCard(slot, selected, regions, now, gui)
 		if region and shownValue then
 			if region.side == "their" then theirTotal = theirTotal + shownValue
 			else yourTotal = yourTotal + shownValue end
@@ -2159,9 +2165,11 @@ function F.updateOverlays()
 	local now = os.clock()
 	local tradeGui = F.findTradeGui()
 	local inventoryGui = F.findInventoryGui()
+	local inventoryRoot = cachedInventoryMarker
 	F.updateModeSelector(inventoryGui, tradeGui)
-	if tradeGui ~= lastTradeGui or inventoryGui ~= lastInventoryGui then
-		lastTradeGui, lastInventoryGui = tradeGui, inventoryGui
+	if tradeGui ~= lastTradeGui or inventoryGui ~= lastInventoryGui
+		or inventoryRoot ~= lastInventoryRoot then
+		lastTradeGui, lastInventoryGui, lastInventoryRoot = tradeGui, inventoryGui, inventoryRoot
 		uiDirty = true
 	end
 	if not uiDirty and now - lastFullScan < CONFIG.FULL_SCAN_SECONDS then return end
@@ -2233,27 +2241,34 @@ F.markDirty(0)
 F.scheduleFallbackScan()
 
 
+
 task.spawn(function()
 	local mainGui = playerGui:WaitForChild("MainGUI", 10)
 	local gameFrame = mainGui and mainGui:WaitForChild("Game", 10)
-	local inv = gameFrame and gameFrame:WaitForChild("Inventory", 10)
-	if inv then
-		table.insert(cleanupConnections, inv:GetPropertyChangedSignal("Visible"):Connect(function()
-			F.markDirty(0)
-		end))
-		local mainFrame = inv:FindFirstChild("Main")
-		if mainFrame then
-			table.insert(cleanupConnections, mainFrame.ChildAdded:Connect(function()
-				F.markDirty(0.05)
-			end))
+	for _, frameName in ipairs({ "Inventory", "ViewProfile" }) do
+		local inventoryFrame = gameFrame and gameFrame:FindFirstChild(frameName)
+		if inventoryFrame then
+			F.watchMutationRoot(inventoryFrame)
+			F.watchVisibility(inventoryFrame, mainGui)
+			table.insert(cleanupConnections,
+				inventoryFrame:GetPropertyChangedSignal("Visible"):Connect(function()
+					F.markDirty(0)
+				end))
 		end
 	end
 	for _, name in ipairs({ "TradeGUI", "TradeGUI_Phone" }) do
 		local tradeGui = playerGui:FindFirstChild(name)
 		if tradeGui then
+			F.watchMutationRoot(tradeGui)
 			table.insert(cleanupConnections, tradeGui:GetPropertyChangedSignal("Enabled"):Connect(function()
 				F.markDirty(0)
 			end))
+			local container = tradeGui:FindFirstChild("Container")
+			if container and container:IsA("GuiObject") then
+				table.insert(cleanupConnections, container:GetPropertyChangedSignal("Visible"):Connect(function()
+					F.markDirty(0)
+				end))
+			end
 		end
 	end
 end)
