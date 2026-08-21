@@ -1,13 +1,12 @@
 -- Большинство скриптов, предназначенных для отображения валюты, нередко распространяются в виде стилеров. В данном случае я намеренно не стал обфусцировать проект по двум причинам: во-первых, разработка этого скрипта не потребовала от меня значительных усилий, а во-вторых, открытый код позволяет каждому самостоятельно убедиться в его содержимом и не переживать за безопасность своего инвентаря.
--- На момент разработки Roblox выпустил очередное обновление античита. Я не могу знать, когда именно вы будете запускать данный скрипт, однако предполагаю, что на некоторых мобильных инжекторах могут возникать ошибки, нестабильная работа или иные недочёты.
+ ̶-̶-̶ ̶Н̶а̶ ̶м̶о̶м̶е̶н̶т̶ ̶р̶а̶з̶р̶а̶б̶о̶т̶к̶и̶ ̶R̶o̶b̶l̶o̶x̶ ̶в̶ы̶п̶у̶с̶т̶и̶л̶ ̶о̶ч̶е̶р̶е̶д̶н̶о̶е̶ ̶о̶б̶н̶о̶в̶л̶е̶н̶и̶е̶ ̶а̶н̶т̶и̶ч̶и̶т̶а̶.̶ ̶Я̶ ̶н̶е̶ ̶м̶о̶г̶у̶ ̶з̶н̶а̶т̶ь̶,̶ ̶к̶о̶г̶д̶а̶ ̶и̶м̶е̶н̶н̶о̶ ̶в̶ы̶ ̶б̶у̶д̶е̶т̶е̶ ̶з̶а̶п̶у̶с̶к̶а̶т̶ь̶ ̶д̶а̶н̶н̶ы̶й̶ ̶с̶к̶р̶и̶п̶т̶,̶ ̶о̶д̶н̶а̶к̶о̶ ̶п̶р̶е̶д̶п̶о̶л̶а̶г̶а̶ю̶,̶ ̶ч̶т̶о̶ ̶н̶а̶ ̶н̶е̶к̶о̶т̶о̶р̶ы̶х̶ ̶м̶о̶б̶и̶л̶ь̶н̶ы̶х̶ ̶и̶н̶ж̶е̶к̶т̶о̶р̶а̶х̶ ̶м̶о̶г̶у̶т̶ ̶в̶о̶з̶н̶и̶к̶а̶т̶ь̶ ̶о̶ш̶и̶б̶к̶и̶,̶ ̶н̶е̶с̶т̶а̶б̶и̶л̶ь̶н̶а̶я̶ ̶р̶а̶б̶о̶т̶а̶ ̶и̶л̶и̶ ̶и̶н̶ы̶е̶ ̶н̶е̶д̶о̶ч̶ё̶т̶ы̶.̶   (fixed)
 -- Вы вправе изменять, дорабатывать и адаптировать данную утилиту под собственные нужды. Ограничений на личную модификацию проекта нет.
 -- LVL 8 EXEC ONLY
-
 
 local Players = game:GetService("Players")
 local localPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
 if game.GameId ~= 66654135 then
-	localPlayer:Kick("wrong game nigga")
+	localPlayer:Kick("Wrong Game")
 	return
 end
 
@@ -26,7 +25,7 @@ local CONFIG = {
 	PRIORITY_TIMEOUT_SECONDS = 5,
 	HTTP_TIMEOUT_SECONDS = 8,
 }
-local SCRIPT_VERSION = "2026.08.19.40-fast-priority-prices"
+local SCRIPT_VERSION = "2026.08.21.41-mobile-trade-layout"
 
 local shared = (getgenv and getgenv()) or _G
 if type(shared.MM2TradeValueOverlayStop) == "function" then
@@ -96,6 +95,7 @@ local loadingRefs = nil
 local loadingStartedAt = 0
 local modeCollapsed = shared.MM2ModePanelCollapsed == true
 local modePanelTween = nil
+local modeVisibilityRevision = 0
 local cleanupConnections = {}
 local uiDirty = true
 local lastFullScan = 0
@@ -437,6 +437,18 @@ function F.offerRegions(tradeGui)
 end
 
 function F.offerRegionFor(slot, regions)
+	local node = slot
+	while node do
+		local name = normalise(node.Name)
+		if name == "youroffer" or name == "theiroffer" then
+			local wanted = name == "youroffer" and "your" or "their"
+			for _, region in ipairs(regions) do
+				if region.side == wanted then return region end
+			end
+			break
+		end
+		node = node.Parent
+	end
 	local centreX = slot.AbsolutePosition.X + slot.AbsoluteSize.X / 2
 	local centreY = slot.AbsolutePosition.Y + slot.AbsoluteSize.Y / 2
 	for _, region in ipairs(regions) do
@@ -448,16 +460,32 @@ function F.offerRegionFor(slot, regions)
 end
 
 function F.findTradeGui()
-	local tradeGui = playerGui:FindFirstChild("TradeGUI") or playerGui:FindFirstChild("TradeGUI_Phone")
-	if tradeGui and tradeGui:IsA("ScreenGui") and tradeGui.Enabled then
+	local function activeTradeGui(tradeGui)
+		if not (tradeGui and tradeGui:IsA("ScreenGui") and tradeGui.Enabled) then return nil end
 		local container = tradeGui:FindFirstChild("Container")
 		if container and container:IsA("GuiObject") and container.Visible then
-			local headers = F.scanOfferHeaders(tradeGui)
+			local headers = tradeGui == cachedTradeGui and cachedHeaders or nil
+			if not headers or #headers < 2
+				or not headers[1]:IsDescendantOf(tradeGui)
+				or not headers[2]:IsDescendantOf(tradeGui)
+				or not F.isEffectivelyVisible(headers[1], tradeGui)
+				or not F.isEffectivelyVisible(headers[2], tradeGui) then
+				headers = F.scanOfferHeaders(tradeGui)
+			end
 			if #headers >= 2 then
 				cachedTradeGui, cachedHeaders = tradeGui, headers
 				return tradeGui
 			end
 		end
+		return nil
+	end
+	if cachedTradeGui and cachedTradeGui.Parent == playerGui then
+		local active = activeTradeGui(cachedTradeGui)
+		if active then return active end
+	end
+	for _, name in ipairs({ "TradeGUI_Phone", "TradeGUI" }) do
+		local active = activeTradeGui(playerGui:FindFirstChild(name))
+		if active then return active end
 	end
 	cachedTradeGui, cachedHeaders = nil, nil
 	if os.clock() < nextTradeSearch then return nil end
@@ -511,13 +539,19 @@ end
 
 function F.findSlot(nameLabel, tradeGui)
 	local node = nameLabel.Parent
+	local fallback = nil
 	while node and node ~= tradeGui do
-		if node:IsA("GuiObject") and node.AbsoluteSize.X >= 55 and node.AbsoluteSize.Y >= 55 then
-			return node
+		if node:IsA("GuiObject") then
+			if normalise(node.Name):match("^newitem%d+$") then return node end
+			if not fallback and node.AbsoluteSize.X >= 55 and node.AbsoluteSize.Y >= 55
+				and (node:FindFirstChildWhichIsA("ImageLabel", true)
+					or node:FindFirstChildWhichIsA("ImageButton", true)) then
+				fallback = node
+			end
 		end
 		node = node.Parent
 	end
-	return nameLabel.Parent
+	return fallback or nameLabel.Parent
 end
 
 local metadataRevision = 0
@@ -887,7 +921,9 @@ end
 function F.isItemCard(slot)
 	if not slot or not slot:IsA("GuiObject") then return false end
 	local size = slot.AbsoluteSize
-	if size.X < 55 or size.Y < 55 or size.X > 220 or size.Y > 240 then return false end
+	local offerSlot = normalise(slot.Name):match("^newitem%d+$") ~= nil
+	local maxWidth, maxHeight = offerSlot and 640 or 300, offerSlot and 640 or 340
+	if size.X < 55 or size.Y < 55 or size.X > maxWidth or size.Y > maxHeight then return false end
 	return slot:FindFirstChildWhichIsA("ImageLabel", true) ~= nil
 		or slot:FindFirstChildWhichIsA("ImageButton", true) ~= nil
 end
@@ -1867,18 +1903,20 @@ function F.makeModeSelector()
 end
 
 function F.updateModeSelector(inventoryGui, tradeGui)
-	local marker
-	if inventoryGui and cachedInventoryMarker then
-		marker = cachedInventoryMarker
-	elseif tradeGui and cachedHeaders and cachedHeaders[1] then
-		marker = cachedHeaders[1]
-	end
-	if not marker then
-		if modeGui then modeGui.Enabled = false end
+	modeVisibilityRevision = modeVisibilityRevision + 1
+	local revision = modeVisibilityRevision
+	if not inventoryGui and not tradeGui then
+		if modeGui and modeGui.Enabled then
+			task.delay(0.14, function()
+				if running and revision == modeVisibilityRevision and modeGui then
+					modeGui.Enabled = false
+				end
+			end)
+		end
 		return
 	end
 	F.makeModeSelector()
-	modeGui.Enabled = true
+	if not modeGui.Enabled then modeGui.Enabled = true end
 end
 
 function F.setOverlayText(overlay, text)
@@ -1911,6 +1949,42 @@ function F.panelRightEdge(header, tradeGui)
 	return header.AbsolutePosition.X + header.AbsoluteSize.X
 end
 
+function F.offerFrameForHeader(header, tradeGui)
+	local node = header
+	while node and node ~= tradeGui do
+		local name = normalise(node.Name)
+		if name == "youroffer" or name == "theiroffer" then return node end
+		node = node.Parent
+	end
+	return nil
+end
+
+function F.horizontalTextBounds(label)
+	local left = label.AbsolutePosition.X
+	local width = label.AbsoluteSize.X
+	local textWidth = math.min(width, label.TextBounds and label.TextBounds.X or 0)
+	if label.TextXAlignment == Enum.TextXAlignment.Center then
+		left = left + (width - textWidth) / 2
+	elseif label.TextXAlignment == Enum.TextXAlignment.Right then
+		left = left + width - textWidth
+	end
+	return left, left + textWidth
+end
+
+function F.mobileTotalBounds(header, tradeGui)
+	local offerFrame = F.offerFrameForHeader(header, tradeGui)
+	local tutorial = offerFrame and offerFrame:FindFirstChild("Tutorial")
+	if not (tutorial and tutorial:IsA("TextLabel") and tutorial.Visible) then return nil end
+	local _, titleRight = F.horizontalTextBounds(header)
+	local tutorialLeft = F.horizontalTextBounds(tutorial)
+	local left = math.floor(titleRight + 10)
+	local right = math.floor(tutorialLeft - 10)
+	if right - left < 72 then return nil end
+	local height = math.clamp(math.floor(header.AbsoluteSize.Y * 0.72), 22, 34)
+	local y = math.floor(header.AbsolutePosition.Y + (header.AbsoluteSize.Y - height) / 2 + 1)
+	return left, y, right - left, height
+end
+
 function F.makeTotalLabel(tradeGui, header)
 	local label = tradeGui:FindFirstChild(TOTAL_NAME)
 	if not label then
@@ -1927,9 +2001,27 @@ function F.makeTotalLabel(tradeGui, header)
 		label.TextYAlignment = Enum.TextYAlignment.Center
 		label.ZIndex = 1001
 		label.Parent = tradeGui
+		local constraint = Instance.new("UITextSizeConstraint")
+		constraint.Name = "ResponsiveTextSize"
+		constraint.MinTextSize = 9
+		constraint.MaxTextSize = 18
+		constraint.Parent = label
 	end
 	totalLabelReference = label
 	if not label.Visible then label.Visible = true end
+	local mobileLeft, mobileY, mobileWidth, mobileHeight = F.mobileTotalBounds(header, tradeGui)
+	if mobileLeft then
+		label.TextScaled = true
+		label.TextXAlignment = Enum.TextXAlignment.Center
+		local mobileSize = UDim2.fromOffset(mobileWidth, mobileHeight)
+		local mobilePosition = UDim2.fromOffset(mobileLeft, mobileY)
+		if label.Size ~= mobileSize then label.Size = mobileSize end
+		if label.Position ~= mobilePosition then label.Position = mobilePosition end
+		return label
+	end
+	label.TextScaled = false
+	label.TextSize = 18
+	label.TextXAlignment = Enum.TextXAlignment.Right
 	local right = F.panelRightEdge(header, tradeGui) - 14
 	local headingWidth = header.TextBounds and header.TextBounds.X or 0
 	local left = header.AbsolutePosition.X + math.max(180, headingWidth + 24)
@@ -2157,10 +2249,12 @@ task.spawn(function()
 			end))
 		end
 	end
-	local tradeGui = playerGui:WaitForChild("TradeGUI", 10)
-	if tradeGui then
-		table.insert(cleanupConnections, tradeGui:GetPropertyChangedSignal("Enabled"):Connect(function()
-			F.markDirty(0)
-		end))
+	for _, name in ipairs({ "TradeGUI", "TradeGUI_Phone" }) do
+		local tradeGui = playerGui:FindFirstChild(name)
+		if tradeGui then
+			table.insert(cleanupConnections, tradeGui:GetPropertyChangedSignal("Enabled"):Connect(function()
+				F.markDirty(0)
+			end))
+		end
 	end
 end)
