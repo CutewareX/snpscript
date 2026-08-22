@@ -13,7 +13,6 @@ local CONFIG = {
 	PUBLIC_CATALOG_URL = "https://mm2-api.b-cdn.net/mm2values.json",
 	FALLBACK_CATALOG_URL = "https://mm2checker.com/tradechecker.html",
 	SCAN_SECONDS = 0.1,
-	FULL_SCAN_SECONDS = 15,
 	SHOW_DEMAND = true,
 	HIDE_AFTER_SECONDS = 0.9,
 	STARPETS_API_URL = "https://mm2-market.apineural.com/api/v2/store/items/all",
@@ -24,7 +23,7 @@ local CONFIG = {
 	PRIORITY_TIMEOUT_SECONDS = 5,
 	HTTP_TIMEOUT_SECONDS = 8,
 }
-local SCRIPT_VERSION = "2026.08.21.45-view-profile-values"
+local SCRIPT_VERSION = "2026.08.22.49-fps-cache"
 
 local shared = (getgenv and getgenv()) or _G
 if type(shared.MM2TradeValueOverlayStop) == "function" then
@@ -102,15 +101,19 @@ shared.MM2StarPetsRubCache = starPetsState
 local modeGui, modePanel, modeCollapseButton, loadingGui = nil, nil, nil, nil
 local loadingRefs = nil
 local loadingStartedAt = 0
+local loadingSuppressed = false
 local modeCollapsed = shared.MM2ModePanelCollapsed == true
 local modePanelTween = nil
 local cleanupConnections = {}
 local uiDirty = true
-local lastFullScan = 0
 local lastTradeGui, lastInventoryGui, lastInventoryRoot = nil, nil, nil
 local watchedProperties = setmetatable({}, { __mode = "k" })
 local watchedMutationRoots = setmetatable({}, { __mode = "k" })
+local watchedInteractionRoots = setmetatable({}, { __mode = "k" })
+local watchedInteractionObjects = setmetatable({}, { __mode = "k" })
+local watchedKnownRoots = setmetatable({}, { __mode = "k" })
 local overlayUpdateScheduled = false
+local uiRefreshToken = 0
 function F.markDirty(delay)
 	uiDirty = true
 	if overlayUpdateScheduled or type(F.updateOverlays) ~= "function" then return end
@@ -171,6 +174,40 @@ function F.isRelevantUiMutation(object)
 	if object:IsA("TextLabel") or object:IsA("TextButton")
 		or object:IsA("ImageLabel") or object:IsA("ImageButton") then return true end
 	return object:IsA("Frame") and object.Name:match("^NewItem%d+$") ~= nil
+end
+
+function F.scheduleUiRefresh()
+	uiRefreshToken = uiRefreshToken + 1
+	local token = uiRefreshToken
+	F.markDirty(0)
+	for _, delay in ipairs({ 0.08, 0.35 }) do
+		task.delay(delay, function()
+			if running and token == uiRefreshToken then F.markDirty(0) end
+		end)
+	end
+end
+
+function F.watchInteractionObject(object)
+	if not object or watchedInteractionObjects[object]
+		or F.isManagedOverlayTree(object) then return end
+	if object:IsA("TextButton") or object:IsA("ImageButton") then
+		watchedInteractionObjects[object] = true
+		table.insert(cleanupConnections, object.Activated:Connect(F.scheduleUiRefresh))
+	elseif object:IsA("TextBox") then
+		watchedInteractionObjects[object] = true
+		F.watchProperty(object, "Text")
+	end
+end
+
+function F.watchInteractionRoot(root)
+	if not root or watchedInteractionRoots[root] then return end
+	watchedInteractionRoots[root] = true
+	for _, object in ipairs(root:GetDescendants()) do
+		F.watchInteractionObject(object)
+	end
+	table.insert(cleanupConnections, root.DescendantAdded:Connect(function(object)
+		F.watchInteractionObject(object)
+	end))
 end
 
 function F.watchMutationRoot(root)
@@ -317,7 +354,7 @@ function F.mergeFallbackCatalog(index)
 			})
 			added = added + 1
 		end
-		if parsed % 200 == 0 then task.wait() end
+		if parsed % 50 == 0 then task.wait() end
 	end
 	if parsed < 800 then return 0, false end
 	return added, true
@@ -356,7 +393,7 @@ function F.refreshPublicCatalog()
 								slug = item.name,
 							})
 							itemCount = itemCount + 1
-							if itemCount % 250 == 0 then task.wait() end
+							if itemCount % 50 == 0 then task.wait() end
 						end
 					end
 				end
@@ -377,6 +414,7 @@ function F.refreshPublicCatalog()
 
 	fallbackCatalogLoading = true
 	task.spawn(function()
+		task.wait(0.5)
 		local ok, added, complete = pcall(F.mergeFallbackCatalog, nextValues)
 		fallbackCatalogLoading = false
 		if running and ok and complete and valuesByName == nextValues then
@@ -419,9 +457,30 @@ function F.isEffectivelyVisible(object, root)
 end
 
 local cachedTradeGui, cachedHeaders = nil, nil
+local offerHeaderSides = setmetatable({}, { __mode = "k" })
 
 function F.scanOfferHeaders(gui)
 	local headers = {}
+	for _, object in ipairs(gui:GetDescendants()) do
+		if object:IsA("GuiObject") and F.isEffectivelyVisible(object, gui) then
+			local side = object.Name == "YourOffer" and "your"
+				or object.Name == "TheirOffer" and "their" or nil
+			if side then
+				local title = object:FindFirstChild("Title")
+				if title and (title:IsA("TextLabel") or title:IsA("TextButton"))
+					and F.isEffectivelyVisible(title, gui) then
+					offerHeaderSides[title] = side
+					F.watchVisibility(title, gui)
+					headers[#headers + 1] = title
+				end
+			end
+		end
+	end
+	if #headers >= 2 then
+		table.sort(headers, function(a, b) return a.AbsolutePosition.Y < b.AbsolutePosition.Y end)
+		return headers
+	end
+	headers = {}
 	for _, object in ipairs(gui:GetDescendants()) do
 		if (object:IsA("TextLabel") or object:IsA("TextButton"))
 			and F.isEffectivelyVisible(object, gui) then
@@ -429,6 +488,8 @@ function F.scanOfferHeaders(gui)
 			local identity = text .. normalise(object.Name)
 			if identity:find("youroffer", 1, true)
 				or identity:find("theiroffer", 1, true) then
+				offerHeaderSides[object] = identity:find("youroffer", 1, true)
+					and "your" or "their"
 				F.watchVisibility(object, gui)
 				table.insert(headers, object)
 			end
@@ -454,11 +515,13 @@ function F.offerRegions(tradeGui)
 	for index, header in ipairs(headers) do
 		local nextHeader = headers[index + 1]
 		local headerText = normalise(header.Text) .. normalise(header.Name)
+		local side = offerHeaderSides[header]
+			or (headerText:find("youroffer", 1, true) and "your" or "their")
 		table.insert(regions, {
 			left = header.AbsolutePosition.X - 8,
 			top = header.AbsolutePosition.Y + header.AbsoluteSize.Y,
 			bottom = nextHeader and (nextHeader.AbsolutePosition.Y - 1) or guiBottom,
-			side = headerText:find("youroffer", 1, true) and "your" or "their",
+			side = side,
 			header = header,
 		})
 	end
@@ -501,10 +564,8 @@ function F.findTradeGui()
 				or not F.isEffectivelyVisible(headers[2], tradeGui) then
 				headers = F.scanOfferHeaders(tradeGui)
 			end
-			if #headers >= 2 then
-				cachedTradeGui, cachedHeaders = tradeGui, headers
-				return tradeGui
-			end
+			cachedTradeGui, cachedHeaders = tradeGui, headers
+			return tradeGui
 		end
 		return nil
 	end
@@ -568,8 +629,12 @@ function F.findSlot(nameLabel, tradeGui)
 end
 
 local metadataRevision = 0
+local slotFingerprintCache = setmetatable({}, { __mode = "k" })
 
-function F.slotFingerprint(slot)
+function F.slotFingerprint(slot, query, visualKey)
+	local cacheKey = tostring(query or "") .. "\0" .. tostring(visualKey or "")
+	local cached = slotFingerprintCache[slot]
+	if cached and cached.key == cacheKey then return cached.value end
 	local parts = {}
 	local function add(value)
 		value = tostring(value or "")
@@ -594,7 +659,9 @@ function F.slotFingerprint(slot)
 	end
 	inspect(slot)
 	for _, object in ipairs(slot:GetDescendants()) do inspect(object) end
-	return normalise(table.concat(parts, " "))
+	local result = normalise(table.concat(parts, " "))
+	slotFingerprintCache[slot] = { key = cacheKey, value = result }
+	return result
 end
 
 function F.slotKind(hint)
@@ -701,7 +768,7 @@ function F.buildGameDatabaseItems()
 				end
 			end
 		end
-		if processedItems % 250 == 0 then task.wait() end
+		if processedItems % 50 == 0 then task.wait() end
 	end
 	if next(result.byName) then
 		gameDatabaseItems = result
@@ -806,7 +873,7 @@ function F.itemKindForRub(slot, record, visualKey)
 	local kind = databaseItem and databaseItem.kind
 		or record.kind
 		or (normalise(record.category) == "pets" and "pet")
-		or F.slotKind(F.slotFingerprint(slot))
+		or F.slotKind(F.slotFingerprint(slot, normalise(record.name), visualKey))
 	if kind then
 		starPetsSlotKinds[slot] = { visualKey = visualKey, revision = metadataRevision, kind = kind }
 	end
@@ -917,7 +984,7 @@ function F.resolveRecord(displayText, slot)
 	local category = databaseItem and databaseItem.rarity or F.slotCategory(slot, query)
 	local context = {
 		query = query,
-		hint = F.slotFingerprint(slot),
+		hint = F.slotFingerprint(slot, query, visualKey),
 		category = category,
 		databaseItem = databaseItem,
 	}
@@ -966,8 +1033,13 @@ function F.itemNameLabelSlot(object, gui)
 end
 
 function F.makeOverlay(slot, overlayName)
-	local label = slot:FindFirstChild(overlayName)
+	local label = slot:FindFirstChild(overlayName, true)
 	if label then return label end
+	local host = slot
+	if normalise(slot.Name):match("^newitem%d+$") then
+		local content = slot:FindFirstChild("Container")
+		if content and content:IsA("GuiObject") then host = content end
+	end
 	label = F.textObject("TextLabel")
 	label.Name = overlayName
 	label.BackgroundTransparency = 1
@@ -984,7 +1056,7 @@ function F.makeOverlay(slot, overlayName)
 	label.RichText = true
 	label.LineHeight = 0.9
 	label.ZIndex = 1000
-	label.Parent = slot
+	label.Parent = host
 
 	return label
 end
@@ -1046,7 +1118,7 @@ end
 function F.addStarPetsItems(index, items)
 	for itemIndex, item in ipairs(items) do
 		F.addStarPetsItem(index, item)
-		if itemIndex % 120 == 0 then task.wait() end
+		if itemIndex % 24 == 0 then task.wait() end
 	end
 end
 
@@ -1117,6 +1189,7 @@ function F.refreshStarPetsCatalog()
 				else
 					failed = tostring(result)
 				end
+				task.wait(0.05)
 			end
 			workersDone = workersDone + 1
 			completed:Fire()
@@ -1507,7 +1580,8 @@ function F.renderLoadingState()
 end
 
 function F.makeLoadingGui()
-	if not loadingState.visible or (loadingGui and loadingGui.Parent) then return end
+	if loadingSuppressed or not loadingState.visible
+		or (loadingGui and loadingGui.Parent) then return end
 	loadingGui = Instance.new("ScreenGui")
 	loadingGui.Name = LOADING_GUI_NAME
 	loadingGui.IgnoreGuiInset = true
@@ -1522,7 +1596,7 @@ function F.makeLoadingGui()
 	dim.BackgroundColor3 = Color3.fromRGB(4, 7, 11)
 	dim.BackgroundTransparency = 0.42
 	dim.BorderSizePixel = 0
-	dim.Active = true
+	dim.Active = false
 	dim.ZIndex = 2099
 	dim.Parent = loadingGui
 
@@ -1602,9 +1676,20 @@ function F.makeLoadingGui()
 
 	loadingRefs = { status = status, percent = percent, fill = fill }
 	F.renderLoadingState()
+	local createdGui = loadingGui
+	task.delay(12, function()
+		if running and loadingGui == createdGui then
+			loadingSuppressed = true
+			loadingState.visible = false
+			loadingRefs = nil
+			loadingGui:Destroy()
+			loadingGui = nil
+		end
+	end)
 end
 
 function F.setLoadingState(status, progress)
+	if loadingSuppressed then return end
 	loadingState.visible = true
 	loadingState.status = status
 	loadingState.progress = progress
@@ -1662,8 +1747,9 @@ function F.collectServerPriorityNames()
 	end
 
 	local scanned, workersDone = 0, 0
-	local workers = math.min(3, #players)
+	local workers = math.min(2, #players)
 	local completed = Instance.new("BindableEvent")
+	local collectorOpen = true
 	for workerIndex = 1, workers do
 		task.spawn(function()
 			for index = workerIndex, #players, workers do
@@ -1678,13 +1764,20 @@ function F.collectServerPriorityNames()
 					("SERVER INVENTORIES · %d/%d"):format(scanned, #players),
 					0.05 + 0.30 * scanned / #players
 				)
-				task.wait(0.04)
+				task.wait(0.08)
 			end
 			workersDone = workersDone + 1
-			completed:Fire()
+			if collectorOpen then pcall(function() completed:Fire() end) end
 		end)
 	end
-	while running and workersDone < workers do completed.Event:Wait() end
+	local deadline = os.clock() + 3.5
+	task.delay(3.5, function()
+		if running and collectorOpen then pcall(function() completed:Fire() end) end
+	end)
+	while running and workersDone < workers and os.clock() < deadline do
+		completed.Event:Wait()
+	end
+	collectorOpen = false
 	completed:Destroy()
 	return names
 end
@@ -1704,8 +1797,10 @@ function F.startPriorityLoading()
 		for _, displayName in pairs(namesByKey) do table.insert(names, displayName) end
 		table.sort(names)
 
-		F.startStarPetsCatalogRefresh()
 		F.loadPriorityStarPets(names)
+		task.delay(1, function()
+			if running then F.startStarPetsCatalogRefresh() end
+		end)
 		F.setLoadingState("PRIORITY PRICES READY", 0.88)
 
 		local valueDeadline = os.clock() + CONFIG.HTTP_TIMEOUT_SECONDS + 2
@@ -2082,7 +2177,7 @@ function F.collectVisibleCardSlots(gui, now)
 
 	local descendants = scanRoot:GetDescendants()
 	local labelsBySlot = {}
-	for _, object in ipairs(descendants) do
+	for objectIndex, object in ipairs(descendants) do
 		if object:IsA("TextLabel")
 			and (object.Name == OVERLAY_NAME or object.Name == INVENTORY_OVERLAY_NAME) then
 			local lastSeen = (object.Name == OVERLAY_NAME and overlayLastSeen
@@ -2101,6 +2196,7 @@ function F.collectVisibleCardSlots(gui, now)
 				end
 			end
 		end
+		if objectIndex % 120 == 0 then task.wait() end
 	end
 	return labelsBySlot
 end
@@ -2118,6 +2214,16 @@ function F.updateCard(slot, selected, regions, now, gui)
 	local defaultItem = DEFAULT_ITEMS[query] or (databaseItem
 		and databaseItem.rarity == "unique" and databaseItem.internalKey ~= "corrupt")
 	local record = candidates and F.resolveRecord(object.Text, slot) or nil
+	if not region then
+		local itemKind = databaseItem and databaseItem.kind
+			or (record and record.kind)
+			or F.slotKind(F.slotFingerprint(slot, query, visualKey))
+		if not defaultItem and itemKind ~= "gun" and itemKind ~= "knife" then
+			local oldOverlay = slot:FindFirstChild(INVENTORY_OVERLAY_NAME, true)
+			if oldOverlay then oldOverlay.Visible = false end
+			return nil, nil
+		end
+	end
 	local overlay = F.makeOverlay(slot, region and OVERLAY_NAME or INVENTORY_OVERLAY_NAME)
 	if not overlay.Visible then overlay.Visible = true end
 	(region and overlayLastSeen or inventoryLastSeen)[overlay] = now
@@ -2156,7 +2262,7 @@ function F.updateCards(gui, regions, now)
 		elseif region then
 			hasUnknown = true
 		end
-		if processedSlots % 16 == 0 then task.wait() end
+		if processedSlots % 8 == 0 then task.wait() end
 	end
 	return yourTotal, theirTotal, hasUnknown
 end
@@ -2172,9 +2278,8 @@ function F.updateOverlays()
 		lastTradeGui, lastInventoryGui, lastInventoryRoot = tradeGui, inventoryGui, inventoryRoot
 		uiDirty = true
 	end
-	if not uiDirty and now - lastFullScan < CONFIG.FULL_SCAN_SECONDS then return end
+	if not uiDirty then return end
 	uiDirty = false
-	lastFullScan = now
 	local regions = tradeGui and F.offerRegions(tradeGui) or nil
 
 	local currentYourTotal, currentTheirTotal, currentHasUnknown = 0, 0, false
@@ -2209,14 +2314,6 @@ function F.updateOverlays()
 		displayedHasUnknown)
 end
 
-function F.scheduleFallbackScan()
-	task.delay(CONFIG.FULL_SCAN_SECONDS, function()
-		if not running then return end
-		F.markDirty(0)
-		F.scheduleFallbackScan()
-	end)
-end
-
 task.spawn(function()
 	local cache = shared.MM2TradeValuesCache
 	if type(cache) == "table" and cache.schema == 7
@@ -2238,37 +2335,51 @@ end)
 F.makeLoadingGui()
 F.startPriorityLoading()
 F.markDirty(0)
-F.scheduleFallbackScan()
 
 
-
-task.spawn(function()
-	local mainGui = playerGui:WaitForChild("MainGUI", 10)
-	local gameFrame = mainGui and mainGui:WaitForChild("Game", 10)
+function F.attachKnownUiRoots()
+	local attached = false
+	if modeGui and modeGui.Parent ~= playerGui then
+		modeGui, modePanel, modeCollapseButton, modePanelTween = nil, nil, nil, nil
+		attached = true
+	end
+	local mainGui = playerGui:FindFirstChild("MainGUI")
+	local gameFrame = mainGui and mainGui:FindFirstChild("Game")
 	for _, frameName in ipairs({ "Inventory", "ViewProfile" }) do
 		local inventoryFrame = gameFrame and gameFrame:FindFirstChild(frameName)
-		if inventoryFrame then
+		if inventoryFrame and not watchedKnownRoots[inventoryFrame] then
+			watchedKnownRoots[inventoryFrame] = true
+			attached = true
 			F.watchMutationRoot(inventoryFrame)
+			F.watchInteractionRoot(inventoryFrame)
 			F.watchVisibility(inventoryFrame, mainGui)
 			table.insert(cleanupConnections,
-				inventoryFrame:GetPropertyChangedSignal("Visible"):Connect(function()
-					F.markDirty(0)
-				end))
+				inventoryFrame:GetPropertyChangedSignal("Visible"):Connect(F.scheduleUiRefresh))
 		end
 	end
 	for _, name in ipairs({ "TradeGUI", "TradeGUI_Phone" }) do
 		local tradeGui = playerGui:FindFirstChild(name)
-		if tradeGui then
+		if tradeGui and not watchedKnownRoots[tradeGui] then
+			watchedKnownRoots[tradeGui] = true
+			attached = true
 			F.watchMutationRoot(tradeGui)
-			table.insert(cleanupConnections, tradeGui:GetPropertyChangedSignal("Enabled"):Connect(function()
-				F.markDirty(0)
-			end))
+			F.watchInteractionRoot(tradeGui)
+			table.insert(cleanupConnections,
+				tradeGui:GetPropertyChangedSignal("Enabled"):Connect(F.scheduleUiRefresh))
 			local container = tradeGui:FindFirstChild("Container")
 			if container and container:IsA("GuiObject") then
-				table.insert(cleanupConnections, container:GetPropertyChangedSignal("Visible"):Connect(function()
-					F.markDirty(0)
-				end))
+				table.insert(cleanupConnections,
+					container:GetPropertyChangedSignal("Visible"):Connect(F.scheduleUiRefresh))
 			end
 		end
+	end
+	if attached then F.scheduleUiRefresh() end
+end
+
+task.spawn(function()
+	F.attachKnownUiRoots()
+	while running do
+		task.wait(3)
+		if running then F.attachKnownUiRoots() end
 	end
 end)
