@@ -23,7 +23,7 @@ local CONFIG = {
 	PRIORITY_TIMEOUT_SECONDS = 5,
 	HTTP_TIMEOUT_SECONDS = 8,
 }
-local SCRIPT_VERSION = "2026.08.22.50-mobile-inventory2"
+local SCRIPT_VERSION = "2026.08.22.51-mobile-large-cards"
 
 local shared = (getgenv and getgenv()) or _G
 if type(shared.MM2TradeValueOverlayStop) == "function" then
@@ -583,9 +583,19 @@ end
 
 local cachedInventoryGui, cachedInventoryMarker = nil, nil
 
+function F.mainGuiCandidates()
+	local output = {}
+	for _, child in ipairs(playerGui:GetChildren()) do
+		if child:IsA("ScreenGui") and child.Name == "MainGUI" then
+			output[#output + 1] = child
+		end
+	end
+	return output
+end
+
 function F.findInventoryGui()
-	local mainGui = playerGui:FindFirstChild("MainGUI")
-	if mainGui and mainGui:IsA("ScreenGui") and mainGui.Enabled then
+	for _, mainGui in ipairs(F.mainGuiCandidates()) do
+		if not mainGui.Enabled then continue end
 		local gameFrame = mainGui:FindFirstChild("Game")
 		for _, frameName in ipairs({ "ViewProfile", "Inventory2", "Inventory" }) do
 			local inventoryFrame = gameFrame and gameFrame:FindFirstChild(frameName)
@@ -1002,7 +1012,7 @@ function F.isItemCard(slot)
 	if not slot or not slot:IsA("GuiObject") then return false end
 	local size = slot.AbsoluteSize
 	local offerSlot = normalise(slot.Name):match("^newitem%d+$") ~= nil
-	local maxWidth, maxHeight = offerSlot and 640 or 300, offerSlot and 640 or 340
+	local maxWidth, maxHeight = offerSlot and 640 or 720, offerSlot and 640 or 760
 	if size.X < 55 or size.Y < 55 or size.X > maxWidth or size.Y > maxHeight then return false end
 	return slot:FindFirstChildWhichIsA("ImageLabel", true) ~= nil
 		or slot:FindFirstChildWhichIsA("ImageButton", true) ~= nil
@@ -2360,18 +2370,19 @@ function F.attachKnownUiRoots()
 		modeGui, modePanel, modeCollapseButton, modePanelTween = nil, nil, nil, nil
 		attached = true
 	end
-	local mainGui = playerGui:FindFirstChild("MainGUI")
-	local gameFrame = mainGui and mainGui:FindFirstChild("Game")
-	for _, frameName in ipairs({ "Inventory", "Inventory2", "ViewProfile" }) do
-		local inventoryFrame = gameFrame and gameFrame:FindFirstChild(frameName)
-		if inventoryFrame and not watchedKnownRoots[inventoryFrame] then
-			watchedKnownRoots[inventoryFrame] = true
-			attached = true
-			F.watchMutationRoot(inventoryFrame)
-			F.watchInteractionRoot(inventoryFrame)
-			F.watchVisibility(inventoryFrame, mainGui)
-			table.insert(cleanupConnections,
-				inventoryFrame:GetPropertyChangedSignal("Visible"):Connect(F.scheduleUiRefresh))
+	for _, mainGui in ipairs(F.mainGuiCandidates()) do
+		local gameFrame = mainGui:FindFirstChild("Game")
+		for _, frameName in ipairs({ "Inventory", "Inventory2", "ViewProfile" }) do
+			local inventoryFrame = gameFrame and gameFrame:FindFirstChild(frameName)
+			if inventoryFrame and not watchedKnownRoots[inventoryFrame] then
+				watchedKnownRoots[inventoryFrame] = true
+				attached = true
+				F.watchMutationRoot(inventoryFrame)
+				F.watchInteractionRoot(inventoryFrame)
+				F.watchVisibility(inventoryFrame, mainGui)
+				table.insert(cleanupConnections,
+					inventoryFrame:GetPropertyChangedSignal("Visible"):Connect(F.scheduleUiRefresh))
+			end
 		end
 	end
 	for _, name in ipairs({ "TradeGUI", "TradeGUI_Phone" }) do
