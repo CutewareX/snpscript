@@ -23,7 +23,7 @@ local CONFIG = {
 	PRIORITY_TIMEOUT_SECONDS = 5,
 	HTTP_TIMEOUT_SECONDS = 8,
 }
-local SCRIPT_VERSION = "2026.08.22.49-fps-cache"
+local SCRIPT_VERSION = "2026.08.22.50-mobile-inventory2"
 
 local shared = (getgenv and getgenv()) or _G
 if type(shared.MM2TradeValueOverlayStop) == "function" then
@@ -587,7 +587,7 @@ function F.findInventoryGui()
 	local mainGui = playerGui:FindFirstChild("MainGUI")
 	if mainGui and mainGui:IsA("ScreenGui") and mainGui.Enabled then
 		local gameFrame = mainGui:FindFirstChild("Game")
-		for _, frameName in ipairs({ "ViewProfile", "Inventory" }) do
+		for _, frameName in ipairs({ "ViewProfile", "Inventory2", "Inventory" }) do
 			local inventoryFrame = gameFrame and gameFrame:FindFirstChild(frameName)
 			local marker = inventoryFrame and (inventoryFrame:FindFirstChild("Main") or inventoryFrame)
 			if inventoryFrame and inventoryFrame:IsA("GuiObject")
@@ -1030,6 +1030,20 @@ function F.itemNameLabelSlot(object, gui)
 	if relativeY < slot.AbsoluteSize.Y * 0.62 then return nil end
 	if object.AbsoluteSize.X < slot.AbsoluteSize.X * 0.42 then return nil end
 	return slot
+end
+
+function F.inventorySectionKind(slot, gui)
+	local node = slot
+	while node and node ~= gui do
+		local name = normalise(node.Name)
+		if name == "weapons" or name == "weapon" then return "weapon" end
+		if name == "effects" or name == "effect" or name == "radios"
+			or name == "radio" or name == "powers" or name == "power"
+			or name == "emotes" or name == "emote" or name == "pets"
+			or name == "pet" then return "other" end
+		node = node.Parent
+	end
+	return nil
 end
 
 function F.makeOverlay(slot, overlayName)
@@ -2215,10 +2229,13 @@ function F.updateCard(slot, selected, regions, now, gui)
 		and databaseItem.rarity == "unique" and databaseItem.internalKey ~= "corrupt")
 	local record = candidates and F.resolveRecord(object.Text, slot) or nil
 	if not region then
+		local sectionKind = F.inventorySectionKind(slot, gui)
 		local itemKind = databaseItem and databaseItem.kind
 			or (record and record.kind)
 			or F.slotKind(F.slotFingerprint(slot, query, visualKey))
-		if not defaultItem and itemKind ~= "gun" and itemKind ~= "knife" then
+		local isWeapon = sectionKind == "weapon" or defaultItem
+			or itemKind == "gun" or itemKind == "knife"
+		if sectionKind == "other" or not isWeapon then
 			local oldOverlay = slot:FindFirstChild(INVENTORY_OVERLAY_NAME, true)
 			if oldOverlay then oldOverlay.Visible = false end
 			return nil, nil
@@ -2345,7 +2362,7 @@ function F.attachKnownUiRoots()
 	end
 	local mainGui = playerGui:FindFirstChild("MainGUI")
 	local gameFrame = mainGui and mainGui:FindFirstChild("Game")
-	for _, frameName in ipairs({ "Inventory", "ViewProfile" }) do
+	for _, frameName in ipairs({ "Inventory", "Inventory2", "ViewProfile" }) do
 		local inventoryFrame = gameFrame and gameFrame:FindFirstChild(frameName)
 		if inventoryFrame and not watchedKnownRoots[inventoryFrame] then
 			watchedKnownRoots[inventoryFrame] = true
